@@ -1154,6 +1154,12 @@ type drimeChunkWriter struct {
 
 	completedPartsMu sync.Mutex
 	completedParts   []api.CompletedPart
+
+	fileHasher    *hash.MultiHasher
+	hashMu        sync.Mutex
+	hashCond      *sync.Cond
+	nextHashChunk int
+	hashErr       error
 }
 
 // OpenChunkWriter returns the chunk size and a ChunkWriter
@@ -1239,6 +1245,10 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 	if ext == "" {
 		ext = "bin"
 	}
+	fileHasher, err := hash.NewMultiHasherTypes(hash.Set(hash.SHA256))
+	if err != nil {
+		return info, nil, fmt.Errorf("failed to create file checksum: %w", err)
+	}
 	chunkWriter := &drimeChunkWriter{
 		uploadID:     resp.UploadID,
 		key:          resp.Key,
@@ -1254,23 +1264,15 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		parentID:     json.Number(directoryID),
 		relativePath: relPath,
 		lastModified: src.ModTime(ctx).UnixMilli(),
+		fileHasher:   fileHasher,
 	}
+	chunkWriter.hashCond = sync.NewCond(&chunkWriter.hashMu)
 	info = fs.ChunkWriterInfo{
 		ChunkSize:         int64(chunkSize),
 		Concurrency:       f.opt.UploadConcurrency,
 		LeavePartsOnError: false,
 	}
 	return info, chunkWriter, err
-}
-
-// hashChunk calculates the part MD5.
-func hashChunk(reader io.Reader) (md5sum []byte, chunkSize int64, err error) {
-	md5Hash := md5.New()
-	chunkSize, err = io.Copy(md5Hash, reader)
-	if err != nil {
-		return nil, 0, err
-	}
-	return md5Hash.Sum(nil), chunkSize, nil
 }
 
 // WriteChunk will write chunk number with reader bytes, where chunk number >= 0
@@ -1284,7 +1286,7 @@ func (s *drimeChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, read
 	}
 
 	// Hash the buffered chunk before upload.
-	md5sum, chunkSize, err := hashChunk(reader)
+	md5sum, chunkSize, err := s.hashChunk(reader, chunkNumber)
 	if err != nil {
 		return 0, fmt.Errorf("failed to calculate chunk checksums: %w", err)
 	}
@@ -1369,6 +1371,33 @@ func (s *drimeChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, read
 	return chunkSize, nil
 }
 
+// hashChunk calculates the part MD5 and adds it to the file SHA-256 in source order.
+func (s *drimeChunkWriter) hashChunk(reader io.ReadSeeker, chunkNumber int) (md5sum []byte, chunkSize int64, err error) {
+	s.hashMu.Lock()
+	defer s.hashMu.Unlock()
+	for chunkNumber != s.nextHashChunk && s.hashErr == nil {
+		s.hashCond.Wait()
+	}
+	if s.hashErr != nil {
+		return nil, 0, s.hashErr
+	}
+	_, err = reader.Seek(0, io.SeekStart)
+	if err == nil {
+		md5Hash := md5.New()
+		chunkSize, err = io.Copy(io.MultiWriter(md5Hash, s.fileHasher), reader)
+		md5sum = md5Hash.Sum(nil)
+	}
+	if err == nil {
+		_, err = reader.Seek(0, io.SeekStart)
+	}
+	if err != nil {
+		s.hashErr = err
+	}
+	s.nextHashChunk++
+	s.hashCond.Broadcast()
+	return md5sum, chunkSize, err
+}
+
 // Close complete chunked writer finalising the file.
 func (s *drimeChunkWriter) Close(ctx context.Context) error {
 	s.completedPartsMu.Lock()
@@ -1404,9 +1433,14 @@ func (s *drimeChunkWriter) Close(ctx context.Context) error {
 	if finalSize < 0 {
 		finalSize = s.written.Load()
 	}
-	fileHash, err := sourceSHA256(ctx, s.src)
-	if err != nil {
-		return fmt.Errorf("failed to calculate source SHA-256: %w", err)
+	fileHash := ""
+	if s.fileHasher != nil {
+		fileHash = s.fileHasher.Sums()[hash.SHA256]
+	} else {
+		fileHash, err = sourceSHA256(ctx, s.src)
+		if err != nil {
+			return fmt.Errorf("failed to calculate source SHA-256: %w", err)
+		}
 	}
 
 	// s3/entries request to create drime object from multipart upload

@@ -2,9 +2,11 @@
 package drime
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"sync"
 	"testing"
 	"time"
 
@@ -59,6 +61,26 @@ func TestObjectHash(t *testing.T) {
 	require.Equal(t, "abc123", got)
 	_, err = o.Hash(context.Background(), hash.MD5)
 	require.ErrorIs(t, err, hash.ErrUnsupported)
+}
+
+func TestHashChunk(t *testing.T) {
+	fileHasher, err := hash.NewMultiHasherTypes(hash.Set(hash.SHA256))
+	require.NoError(t, err)
+	s := &drimeChunkWriter{fileHasher: fileHasher}
+	s.hashCond = sync.NewCond(&s.hashMu)
+	first := bytes.NewReader([]byte("first"))
+	second := bytes.NewReader([]byte("second"))
+
+	md5sum, _, err := s.hashChunk(first, 0)
+	require.NoError(t, err)
+	require.Equal(t, "8b04d5e3775d298e78455efc5ca404d5", hex.EncodeToString(md5sum))
+	md5sum, _, err = s.hashChunk(second, 1)
+	require.NoError(t, err)
+	require.Equal(t, "a9f0e61a137d86aa9db53465e0801612", hex.EncodeToString(md5sum))
+	require.Equal(t, 5, first.Len())
+	require.Equal(t, 6, second.Len())
+	want := sha256.Sum256([]byte("firstsecond"))
+	require.Equal(t, hex.EncodeToString(want[:]), fileHasher.Sums()[hash.SHA256])
 }
 
 // TestIntegration runs integration tests against the remote
