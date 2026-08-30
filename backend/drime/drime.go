@@ -16,6 +16,7 @@ should stay under that.
 import (
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -1173,7 +1174,7 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		return info, nil, err
 	}
 
-	// Send just the leaf as relativePath, matching the single-part /uploads
+	// Send just the leaf as relativePath, matching the simple upload
 	// convention. The file is placed by parentId; sending an absolute path
 	// here makes the server build folders from it and drop "0" path segments.
 	relPath := f.opt.Enc.FromStandardName(leaf)
@@ -1711,7 +1712,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		}()
 	}
 
-	if size < 0 || size > int64(o.fs.opt.UploadCutoff) {
+	if size < 0 || size >= int64(minChunkSize) || size > int64(o.fs.opt.UploadCutoff) {
 		chunkWriter, err := multipart.UploadMultipart(ctx, src, in, multipart.UploadMultipartOptions{
 			Open:        o.fs,
 			OpenOptions: options,
@@ -1724,32 +1725,91 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return o.setMetaData(&s.fileEntry)
 	}
 
-	// Do the upload
-	var resp *http.Response
-	var result api.UploadResponse
+	// Get a presigned URL
 	encodedLeaf := o.fs.opt.Enc.FromStandardName(leaf)
-	opts := rest.Opts{
-		Method: "POST",
-		Body:   in,
-		MultipartParams: url.Values{
-			"parentId":     {directoryID},
-			"relativePath": {encodedLeaf},
-			"workspaceId":  {o.fs.opt.WorkspaceID},
-		},
-		MultipartContentName: "file",
-		MultipartFileName:    encodedLeaf,
-		MultipartContentType: fs.MimeType(ctx, src),
-		Path:                 "/uploads",
-		Options:              options,
+	mime := fs.MimeType(ctx, src)
+	extension := strings.TrimPrefix(path.Ext(leaf), ".")
+	if extension == "" {
+		extension = "bin"
 	}
-	err = o.fs.pacer.CallNoRetry(func() (bool, error) {
-		resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &result)
+	presignReq := api.SimpleUploadRequest{
+		Filename:     leaf,
+		Mime:         mime,
+		Size:         size,
+		Extension:    extension,
+		WorkspaceID:  o.fs.opt.WorkspaceID,
+		RelativePath: encodedLeaf,
+		ParentID:     json.Number(directoryID),
+	}
+	var presign api.SimpleUploadResponse
+	presignOpts := rest.Opts{
+		Method:  "POST",
+		Path:    "/s3/simple/presign",
+		Options: options,
+	}
+	err = o.fs.pacer.Call(func() (bool, error) {
+		resp, err := o.fs.srv.CallJSON(ctx, &presignOpts, presignReq, &presign)
 		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to get presigned upload URL: %w", err)
+	}
+
+	// Upload while calculating checksums
+	md5Hash := md5.New()
+	fileHash := sha256.New()
+	uploadOpts := rest.Opts{
+		Method:        "PUT",
+		RootURL:       presign.URL,
+		Body:          io.TeeReader(in, io.MultiWriter(md5Hash, fileHash)),
+		ContentType:   mime,
+		ContentLength: &size,
+		NoResponse:    true,
+		ExtraHeaders: map[string]string{
+			"Authorization": "",
+		},
+	}
+	var uploadResp *http.Response
+	err = o.fs.pacer.CallNoRetry(func() (bool, error) {
+		uploadResp, err = o.fs.srv.Call(ctx, &uploadOpts)
+		return shouldRetry(ctx, uploadResp, err)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to upload file: %w", err)
 	}
-	return o.setMetaData(&result.FileEntry)
+	etag := uploadResp.Header.Get("ETag")
+	expectedETag := hex.EncodeToString(md5Hash.Sum(nil))
+	if strings.Trim(strings.ToLower(etag), `"`) != expectedETag {
+		return fmt.Errorf("uploaded file checksum mismatch: ETag %q, expected %q", etag, expectedETag)
+	}
+
+	// Register the uploaded file
+	entryReq := api.MultiPartEntriesRequest{
+		ClientMime:      mime,
+		ClientName:      leaf,
+		Key:             presign.Key,
+		Filename:        path.Base(presign.Key),
+		Size:            size,
+		ClientExtension: extension,
+		LastModified:    src.ModTime(ctx).UnixMilli(),
+		FileHash:        hex.EncodeToString(fileHash.Sum(nil)),
+		ParentID:        json.Number(directoryID),
+		RelativePath:    encodedLeaf,
+		WorkspaceID:     o.fs.opt.WorkspaceID,
+	}
+	entryOpts := rest.Opts{
+		Method: "POST",
+		Path:   "/s3/entries",
+	}
+	var entry api.MultiPartEntriesResponse
+	err = o.fs.pacer.Call(func() (bool, error) {
+		resp, err := o.fs.srv.CallJSON(ctx, &entryOpts, entryReq, &entry)
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create entry after upload: %w", err)
+	}
+	return o.setMetaData(&entry.FileEntry)
 }
 
 // Remove an object
