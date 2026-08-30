@@ -770,7 +770,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 
 // Precision return the precision of this Fs
 func (f *Fs) Precision() time.Duration {
-	return fs.ModTimeNotSupported
+	return time.Millisecond
 }
 
 // Purge deletes all the files and the container
@@ -1599,7 +1599,11 @@ func (o *Object) Size() int64 {
 func (o *Object) setMetaDataAny(info *api.Item) {
 	o.size = info.FileSize
 	o.fileHash, _ = info.FileHash.(string)
-	o.modTime = info.UpdatedAt
+	if info.ClientLastModified != nil {
+		o.modTime = time.UnixMilli(*info.ClientLastModified)
+	} else {
+		o.modTime = info.UpdatedAt
+	}
 	o.id = info.ID.String()
 	o.dirID = info.ParentID.String()
 	o.mimeType = info.Mime
@@ -1637,9 +1641,31 @@ func (o *Object) ModTime(ctx context.Context) time.Time {
 	return o.modTime
 }
 
-// SetModTime sets the modification time of the local fs object
+// SetModTime sets the original modification time of the object.
 func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
-	return fs.ErrorCantSetModTime
+	request := api.SetMetadataRequest{
+		LastModified: modTime.UnixMilli(),
+	}
+	var result api.SetMetadataResponse
+	opts := rest.Opts{
+		Method: "POST",
+		Path:   "/file-entries/" + o.id + "/metadata",
+	}
+	if o.fs.opt.WorkspaceID != "" {
+		opts.Parameters = url.Values{}
+		opts.Parameters.Set("workspaceId", o.fs.opt.WorkspaceID)
+	}
+	var resp *http.Response
+	var err error
+	err = o.fs.pacer.Call(func() (bool, error) {
+		resp, err = o.fs.srv.CallJSON(ctx, &opts, &request, &result)
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to set modification time: %w", err)
+	}
+	o.modTime = time.UnixMilli(request.LastModified)
+	return nil
 }
 
 // Storable returns a boolean showing whether this object storable

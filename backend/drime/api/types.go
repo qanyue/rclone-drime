@@ -35,39 +35,40 @@ type Permissions struct {
 
 // Item describes a folder or a file as returned by /drive/file-entries
 type Item struct {
-	ID           json.Number `json:"id"`
-	Name         string      `json:"name"`
-	Description  any         `json:"description"`
-	FileName     string      `json:"file_name"`
-	Mime         string      `json:"mime"`
-	Color        any         `json:"color"`
-	Backup       bool        `json:"backup"`
-	Tracked      int         `json:"tracked"`
-	FileSize     int64       `json:"file_size"`
-	UserID       json.Number `json:"user_id"`
-	ParentID     json.Number `json:"parent_id"`
-	CreatedAt    time.Time   `json:"created_at"`
-	UpdatedAt    time.Time   `json:"updated_at"`
-	DeletedAt    any         `json:"deleted_at"`
-	IsDeleted    int         `json:"is_deleted"`
-	Path         string      `json:"path"`
-	DiskPrefix   any         `json:"disk_prefix"`
-	Type         string      `json:"type"`
-	Extension    any         `json:"extension"`
-	FileHash     any         `json:"file_hash"`
-	Public       bool        `json:"public"`
-	Thumbnail    bool        `json:"thumbnail"`
-	ThumbnailURL any         `json:"thumbnail_url"`
-	WorkspaceID  int         `json:"workspace_id"`
-	IsEncrypted  int         `json:"is_encrypted"`
-	Iv           any         `json:"iv"`
-	VaultID      any         `json:"vault_id"`
-	OwnerID      int         `json:"owner_id"`
-	Hash         string      `json:"hash"`
-	URL          string      `json:"url"`
-	Users        []User      `json:"users"`
-	Tags         []any       `json:"tags"`
-	Permissions  Permissions `json:"permissions"`
+	ID                 json.Number `json:"id"`
+	Name               string      `json:"name"`
+	Description        any         `json:"description"`
+	FileName           string      `json:"file_name"`
+	Mime               string      `json:"mime"`
+	Color              any         `json:"color"`
+	Backup             bool        `json:"backup"`
+	Tracked            int         `json:"tracked"`
+	FileSize           int64       `json:"file_size"`
+	UserID             json.Number `json:"user_id"`
+	ParentID           json.Number `json:"parent_id"`
+	CreatedAt          time.Time   `json:"created_at"`
+	UpdatedAt          time.Time   `json:"updated_at"`
+	ClientLastModified *int64      `json:"client_last_modified"`
+	DeletedAt          any         `json:"deleted_at"`
+	IsDeleted          int         `json:"is_deleted"`
+	Path               string      `json:"path"`
+	DiskPrefix         any         `json:"disk_prefix"`
+	Type               string      `json:"type"`
+	Extension          any         `json:"extension"`
+	FileHash           any         `json:"file_hash"`
+	Public             bool        `json:"public"`
+	Thumbnail          bool        `json:"thumbnail"`
+	ThumbnailURL       any         `json:"thumbnail_url"`
+	WorkspaceID        int         `json:"workspace_id"`
+	IsEncrypted        int         `json:"is_encrypted"`
+	Iv                 any         `json:"iv"`
+	VaultID            any         `json:"vault_id"`
+	OwnerID            int         `json:"owner_id"`
+	Hash               string      `json:"hash"`
+	URL                string      `json:"url"`
+	Users              []User      `json:"users"`
+	Tags               []any       `json:"tags"`
+	Permissions        Permissions `json:"permissions"`
 }
 
 // Listing response
@@ -138,6 +139,17 @@ type UpdateItemRequest struct {
 type UpdateItemResponse struct {
 	Status    string `json:"status"`
 	FileEntry Item   `json:"fileEntry"`
+}
+
+// SetMetadataRequest describes metadata updates for a file entry.
+type SetMetadataRequest struct {
+	LastModified int64 `json:"lastModified"`
+}
+
+// SetMetadataResponse is returned by the file-entry metadata endpoint.
+type SetMetadataResponse struct {
+	Status  string `json:"status"`
+	Updated bool   `json:"updated"`
 }
 
 // MoveRequest is the input to /file-entries/move
