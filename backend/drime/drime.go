@@ -15,6 +15,8 @@ should stay under that.
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,6 +44,7 @@ import (
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/multipart"
 	"github.com/rclone/rclone/lib/pacer"
+	"github.com/rclone/rclone/lib/pool"
 	"github.com/rclone/rclone/lib/random"
 	"github.com/rclone/rclone/lib/rest"
 )
@@ -209,6 +212,7 @@ type Object struct {
 	size     int64     // size of the object
 	modTime  time.Time // modification time of the object
 	id       string    // ID of the object
+	fileHash string    // sha256 hash of the object
 	dirID    string    // ID of the object's directory
 	mimeType string    // mime type of the object
 	url      string    // where to download this object
@@ -780,7 +784,7 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 // patch an attribute on an object to value
 func (f *Fs) patch(ctx context.Context, id, attribute string, value string) (item *api.Item, err error) {
 	var resp *http.Response
-	var request = api.UpdateItemRequest{
+	request := api.UpdateItemRequest{
 		Name: value,
 	}
 	var result api.UpdateItemResponse
@@ -817,7 +821,7 @@ func (f *Fs) rename(ctx context.Context, id, newLeaf string) (item *api.Item, er
 // func (f *Fs) move(ctx context.Context, id, newDirID string, dstLeaf string) (item *api.Item, err error) {
 func (f *Fs) move(ctx context.Context, id, newDirID string) (err error) {
 	var resp *http.Response
-	var request = api.MoveRequest{
+	request := api.MoveRequest{
 		EntryIDs:      []string{id},
 		DestinationID: newDirID,
 	}
@@ -1015,7 +1019,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 // copy a file or a folder to a new directory
 func (f *Fs) copy(ctx context.Context, id, newDirID string) (item *api.Item, err error) {
 	var resp *http.Response
-	var request = api.CopyRequest{
+	request := api.CopyRequest{
 		EntryIDs:      []string{id},
 		DestinationID: newDirID,
 	}
@@ -1122,21 +1126,24 @@ func (f *Fs) DirCacheFlush() {
 
 // Hashes returns the supported hash sets.
 func (f *Fs) Hashes() hash.Set {
-	return hash.Set(hash.None)
+	return hash.Set(hash.SHA256)
 }
 
 var warnStreamUpload sync.Once
 
 // Status of open chunked upload
 type drimeChunkWriter struct {
-	uploadID  string
-	key       string
-	chunkSize int64
-	size      int64
-	f         *Fs
-	o         *Object
-	written   atomic.Int64
-	fileEntry api.Item
+	uploadID     string
+	key          string
+	chunkSize    int64
+	size         int64
+	f            *Fs
+	o            *Object
+	src          fs.ObjectInfo
+	written      atomic.Int64
+	fileEntry    api.Item
+	destination  *api.Destination
+	lastModified int64
 
 	uploadName   string
 	leaf         string
@@ -1173,6 +1180,14 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 
 	size := src.Size()
 	fs.FixRangeOption(options, size)
+
+	// var destination *api.Destination
+	// if dirPath, ok := f.dirCache.GetInv(directoryID); ok {
+	// 	destination = &api.Destination{
+	// 		Name: path.Base(dirPath),
+	// 		Hash: strings.TrimRight(base64.RawStdEncoding.EncodeToString([]byte(directoryID+"|")), "="),
+	// 	}
+	// }
 
 	// calculate size of parts
 	chunkSize := f.opt.ChunkSize
@@ -1214,7 +1229,6 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		res, err := o.fs.srv.CallJSON(ctx, &opts, req, &resp)
 		return shouldRetry(ctx, res, err)
 	})
-
 	if err != nil {
 		return info, nil, fmt.Errorf("failed to initiate multipart upload: %w", err)
 	}
@@ -1232,12 +1246,14 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		size:         size,
 		f:            f,
 		o:            o,
+		src:          src,
 		uploadName:   path.Base(resp.Key),
 		leaf:         leaf,
 		mime:         mime,
 		extension:    ext,
 		parentID:     json.Number(directoryID),
 		relativePath: relPath,
+		lastModified: src.ModTime(ctx).UnixMilli(),
 	}
 	info = fs.ChunkWriterInfo{
 		ChunkSize:         int64(chunkSize),
@@ -1247,21 +1263,34 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 	return info, chunkWriter, err
 }
 
+// hashChunk calculates the part MD5.
+func hashChunk(reader io.Reader) (md5sum []byte, chunkSize int64, err error) {
+	md5Hash := md5.New()
+	chunkSize, err = io.Copy(md5Hash, reader)
+	if err != nil {
+		return nil, 0, err
+	}
+	return md5Hash.Sum(nil), chunkSize, nil
+}
+
 // WriteChunk will write chunk number with reader bytes, where chunk number >= 0
 func (s *drimeChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (bytesWritten int64, err error) {
-	// chunk numbers between 1 and 100000
-	chunkNumber++
+	// part numbers between 1 and 100000,because upload part start with 1
+	partNumber := chunkNumber + 1
 
-	// find size of chunk
-	chunkSize, err := reader.Seek(0, io.SeekEnd)
-	if err != nil {
-		return 0, fmt.Errorf("failed to seek chunk: %w", err)
+	// Only account after the checksum read has been done.
+	if do, ok := reader.(pool.DelayAccountinger); ok {
+		do.DelayAccounting(2)
 	}
 
-	if chunkSize == 0 && chunkNumber != 1 {
+	// Hash the buffered chunk before upload.
+	md5sum, chunkSize, err := hashChunk(reader)
+	if err != nil {
+		return 0, fmt.Errorf("failed to calculate chunk checksums: %w", err)
+	}
+	if chunkSize == 0 && partNumber != 1 {
 		return 0, nil
 	}
-
 	partOpts := rest.Opts{
 		Method: "POST",
 		Path:   "/s3/multipart/batch-sign-part-urls",
@@ -1271,7 +1300,7 @@ func (s *drimeChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, read
 		UploadID: s.uploadID,
 		Key:      s.key,
 		PartNumbers: []int{
-			chunkNumber,
+			partNumber,
 		},
 	}
 
@@ -1281,7 +1310,6 @@ func (s *drimeChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, read
 		res, err := s.f.srv.CallJSON(ctx, &partOpts, req, &resp)
 		return shouldRetry(ctx, res, err)
 	})
-
 	if err != nil {
 		return 0, fmt.Errorf("failed to get part URL: %w", err)
 	}
@@ -1313,19 +1341,25 @@ func (s *drimeChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, read
 		uploadRes, err = s.f.srv.Call(ctx, &opts)
 		return shouldRetry(ctx, uploadRes, err)
 	})
-
 	if err != nil {
-		return 0, fmt.Errorf("failed to upload part %d: %w", chunkNumber, err)
+		return 0, fmt.Errorf("failed to upload part %d: %w", partNumber, err)
 	}
 
 	// Get ETag from response
 	etag := uploadRes.Header.Get("ETag")
 	fs.CheckClose(uploadRes.Body, &err)
+	if err != nil {
+		return 0, fmt.Errorf("failed to close upload response: %w", err)
+	}
+	expectedETag := hex.EncodeToString(md5sum)
+	if strings.Trim(strings.ToLower(etag), `"`) != expectedETag {
+		return 0, fmt.Errorf("uploaded part %d checksum mismatch: ETag %q, expected %q", partNumber, etag, expectedETag)
+	}
 
 	s.completedPartsMu.Lock()
 	defer s.completedPartsMu.Unlock()
 	s.completedParts = append(s.completedParts, api.CompletedPart{
-		PartNumber: int32(chunkNumber),
+		PartNumber: int32(partNumber),
 		ETag:       etag,
 	})
 
@@ -1362,7 +1396,6 @@ func (s *drimeChunkWriter) Close(ctx context.Context) error {
 		res, err := s.f.srv.CallJSON(ctx, &completeOpts, completeBody, &response)
 		return shouldRetry(ctx, res, err)
 	})
-
 	if err != nil {
 		return fmt.Errorf("failed to complete multipart upload: %w", err)
 	}
@@ -1371,14 +1404,22 @@ func (s *drimeChunkWriter) Close(ctx context.Context) error {
 	if finalSize < 0 {
 		finalSize = s.written.Load()
 	}
+	fileHash, err := sourceSHA256(ctx, s.src)
+	if err != nil {
+		return fmt.Errorf("failed to calculate source SHA-256: %w", err)
+	}
 
 	// s3/entries request to create drime object from multipart upload
 	req := api.MultiPartEntriesRequest{
 		ClientMime:      s.mime,
 		ClientName:      s.leaf,
+		Key:             s.key,
 		Filename:        s.uploadName,
 		Size:            finalSize,
 		ClientExtension: s.extension,
+		LastModified:    s.lastModified,
+		FileHash:        fileHash,
+		Destination:     s.destination,
 		ParentID:        s.parentID,
 		RelativePath:    s.relativePath,
 		WorkspaceID:     s.f.opt.WorkspaceID,
@@ -1421,12 +1462,38 @@ func (s *drimeChunkWriter) Abort(ctx context.Context) error {
 		res, err := s.f.srv.CallJSON(ctx, &opts, req, nil)
 		return shouldRetry(ctx, res, err)
 	})
-
 	if err != nil {
 		return fmt.Errorf("failed to abort multipart upload: %w", err)
 	}
 
 	return nil
+}
+
+// sourceSHA256 returns the source SHA-256, reopening the source when necessary.
+func sourceSHA256(ctx context.Context, src fs.ObjectInfo) (sum string, err error) {
+	sum, err = src.Hash(ctx, hash.SHA256)
+	if err != nil && !errors.Is(err, hash.ErrUnsupported) {
+		return "", err
+	}
+
+	if sum != "" {
+		return sum, nil
+	}
+	obj, ok := src.(fs.Object)
+	if !ok {
+		return "", nil
+	}
+	in, err := obj.Open(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer fs.CheckClose(in, &err)
+
+	sums, err := hash.StreamTypes(in, hash.NewHashSet(hash.SHA256))
+	if err != nil {
+		return "", err
+	}
+	return sums[hash.SHA256], nil
 }
 
 // About gets quota information
@@ -1482,6 +1549,9 @@ func (o *Object) Remote() string {
 
 // Hash returns the hash of an object returning a lowercase hex string
 func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
+	if t == hash.SHA256 {
+		return o.fileHash, nil
+	}
 	return "", hash.ErrUnsupported
 }
 
@@ -1493,6 +1563,7 @@ func (o *Object) Size() int64 {
 // setMetaDataAny sets the metadata from info but doesn't check the type
 func (o *Object) setMetaDataAny(info *api.Item) {
 	o.size = info.FileSize
+	o.fileHash, _ = info.FileHash.(string)
 	o.modTime = info.UpdatedAt
 	o.id = info.ID.String()
 	o.dirID = info.ParentID.String()
@@ -1622,7 +1693,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	// Do the upload
 	var resp *http.Response
 	var result api.UploadResponse
-	var encodedLeaf = o.fs.opt.Enc.FromStandardName(leaf)
+	encodedLeaf := o.fs.opt.Enc.FromStandardName(leaf)
 	opts := rest.Opts{
 		Method: "POST",
 		Body:   in,
