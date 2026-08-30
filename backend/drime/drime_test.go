@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rclone/rclone/backend/drime/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/object"
@@ -61,6 +62,19 @@ func TestObjectHash(t *testing.T) {
 	require.Equal(t, "abc123", got)
 	_, err = o.Hash(context.Background(), hash.MD5)
 	require.ErrorIs(t, err, hash.ErrUnsupported)
+}
+
+func TestObjectModTime(t *testing.T) {
+	clientLastModified := time.Date(2024, time.January, 2, 3, 4, 5, 678000000, time.UTC).UnixMilli()
+	o := &Object{}
+	o.setMetaDataAny(&api.Item{
+		UpdatedAt:          time.Date(2025, time.January, 2, 3, 4, 5, 0, time.UTC),
+		ClientLastModified: &clientLastModified,
+	})
+	require.Equal(t, time.UnixMilli(clientLastModified), o.ModTime(context.Background()))
+
+	o.setMetaDataAny(&api.Item{UpdatedAt: time.Date(2025, time.January, 2, 3, 4, 5, 0, time.UTC)})
+	require.Equal(t, time.Date(2025, time.January, 2, 3, 4, 5, 0, time.UTC), o.ModTime(context.Background()))
 }
 
 func TestHashChunk(t *testing.T) {
