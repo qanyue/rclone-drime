@@ -216,14 +216,24 @@ type MultiPartCompleteResponse struct {
 
 // MultiPartEntriesRequest is the input to POST /s3/entries
 type MultiPartEntriesRequest struct {
-	ClientMime      string      `json:"clientMime"`
-	ClientName      string      `json:"clientName"`
-	Filename        string      `json:"filename"`
-	Size            int64       `json:"size"`
-	ClientExtension string      `json:"clientExtension"`
-	ParentID        json.Number `json:"parentId"`
-	RelativePath    string      `json:"relativePath"`
-	WorkspaceID     string      `json:"workspaceId,omitempty"`
+	ClientMime      string       `json:"clientMime"`
+	ClientName      string       `json:"clientName"`
+	Key             string       `json:"key"`
+	Filename        string       `json:"filename"`
+	Size            int64        `json:"size"`
+	ClientExtension string       `json:"clientExtension"`
+	LastModified    int64        `json:"lastModified"`
+	FileHash        string       `json:"fileHash,omitempty"`
+	Destination     *Destination `json:"destination,omitempty"`
+	ParentID        json.Number  `json:"parentId"`
+	RelativePath    string       `json:"relativePath"`
+	WorkspaceID     string       `json:"workspaceId,omitempty"`
+}
+
+// Destination describes the parent folder for a multipart entry.
+type Destination struct {
+	Name string `json:"name"`
+	Hash string `json:"hash"`
 }
 
 // MultiPartEntriesResponse is the result of POST /s3/entries
