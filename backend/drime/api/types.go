@@ -181,6 +181,15 @@ type MultiPartCreateResponse struct {
 	Key      string `json:"key"`
 }
 
+// SimpleUploadRequest is the input of POST /s3/simple/presign.
+type SimpleUploadRequest = MultiPartCreateRequest
+
+// SimpleUploadResponse is returned by POST /s3/simple/presign.
+type SimpleUploadResponse struct {
+	URL string `json:"url"`
+	Key string `json:"key"`
+}
+
 // CompletedPart Type for completed parts when making a multipart upload.
 type CompletedPart struct {
 	ETag       string `json:"ETag"`
