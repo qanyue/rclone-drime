@@ -58,7 +58,7 @@ type Item struct {
 	FileHash           any         `json:"file_hash"`
 	Public             bool        `json:"public"`
 	Thumbnail          bool        `json:"thumbnail"`
-	ThumbnailURL       any        `json:"thumbnail_url"`
+	ThumbnailURL       any         `json:"thumbnail_url"`
 	WorkspaceID        int         `json:"workspace_id"`
 	IsEncrypted        int         `json:"is_encrypted"`
 	Iv                 any         `json:"iv"`
@@ -194,6 +194,19 @@ type SetMetadataRequest struct {
 type SetMetadataResponse struct {
 	Status  string `json:"status"`
 	Updated bool   `json:"updated"`
+}
+
+// VerifyIntegrityRequest is the input to POST /file-entries/{id}/verify-integrity.
+type VerifyIntegrityRequest struct {
+	SHA256 string `json:"sha256"`
+}
+
+// VerifyIntegrityResponse is returned by the file integrity endpoint.
+type VerifyIntegrityResponse struct {
+	Status     string `json:"status"`
+	Verified   bool   `json:"verified"`
+	ServerHash string `json:"serverHash"`
+	Reason     string `json:"reason"`
 }
 
 // MoveRequest is the input to /file-entries/move
