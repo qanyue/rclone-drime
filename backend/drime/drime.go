@@ -304,7 +304,7 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.It
 	var metadataErr error
 	found, err := f.listAll(ctx, directoryID, false, true, leaf, func(item *api.Item) bool {
 		if item.Name == leaf {
-			metadataErr = f.fetchMetadata(ctx, item)
+			metadataErr = f.verifyMetadata(ctx, item)
 			info = item
 			return true
 		}
@@ -327,7 +327,7 @@ func (f *Fs) getItem(ctx context.Context, id string, dirID string, leaf string) 
 	var metadataErr error
 	found, err := f.listAll(ctx, dirID, false, true, leaf, func(item *api.Item) bool {
 		if item.ID.String() == id {
-			metadataErr = f.fetchMetadata(ctx, item)
+			metadataErr = f.verifyMetadata(ctx, item)
 			info = item
 			return true
 		}
@@ -346,7 +346,7 @@ func (f *Fs) getItem(ctx context.Context, id string, dirID string, leaf string) 
 func (f *Fs) readMetaDataForID(ctx context.Context, id string) (info *api.Item, err error) {
 	opts := rest.Opts{
 		Method:  "GET",
-		RootURL: baseURL + "drive/api/v1/file-entries/" + id + "/model",
+		RootURL: baseURL + "api/v1/file-entries/" + id + "/model",
 	}
 	if f.opt.WorkspaceID != "" {
 		opts.Parameters = url.Values{}
@@ -361,13 +361,13 @@ func (f *Fs) readMetaDataForID(ctx context.Context, id string) (info *api.Item, 
 		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to read item model: %w", err)
+		return nil, fmt.Errorf("failed to read item model for id: %w", err)
 	}
 	return &result.FileEntry, nil
 }
 
-// fetchMetadata replaces an incomplete list item with its full item model.
-func (f *Fs) fetchMetadata(ctx context.Context, item *api.Item) error {
+// verifyMetadata replaces an incomplete list item with its full item model.
+func (f *Fs) verifyMetadata(ctx context.Context, item *api.Item) error {
 	if ok, _ := item.HasRequiredMetadata(); ok {
 		return nil
 	}
@@ -666,7 +666,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	}
 	var iErr error
 	_, err = f.listAll(ctx, directoryID, false, false, "", func(info *api.Item) bool {
-		if err := f.fetchMetadata(ctx, info); err != nil {
+		if err := f.verifyMetadata(ctx, info); err != nil {
 			iErr = err
 			return true
 		}
@@ -1534,6 +1534,9 @@ func (s *drimeChunkWriter) Close(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to create entry after multipart upload: %w", err)
 	}
+	if err = s.f.verifyIntegrity(ctx, res.FileEntry.ID.String(), fileHash); err != nil {
+		return err
+	}
 	s.fileEntry = res.FileEntry
 
 	return nil
@@ -1764,6 +1767,32 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	return resp.Body, err
 }
 
+// verifyIntegrity asks Drime to compare the stored file with its SHA-256.
+func (f *Fs) verifyIntegrity(ctx context.Context, id, fileHash string) error {
+	request := api.VerifyIntegrityRequest{SHA256: fileHash}
+	var result api.VerifyIntegrityResponse
+	opts := rest.Opts{
+		Method: "POST",
+		Path:   "/file-entries/" + id + "/verify-integrity",
+	}
+	var resp *http.Response
+	var err error
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err = f.srv.CallJSON(ctx, &opts, &request, &result)
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to verify file integrity: %w", err)
+	}
+	if !result.Verified {
+		if result.Reason != "" {
+			return fmt.Errorf("file integrity verification failed: %s", result.Reason)
+		}
+		return fmt.Errorf("file integrity verification failed: server hash %q does not match %q", result.ServerHash, fileHash)
+	}
+	return nil
+}
+
 // Update the object with the contents of the io.Reader, modTime and size
 //
 // If existing is set then it updates the object rather than creating a new one.
@@ -1869,6 +1898,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if strings.Trim(strings.ToLower(etag), `"`) != expectedETag {
 		return fmt.Errorf("uploaded file checksum mismatch: ETag %q, expected %q", etag, expectedETag)
 	}
+	fileHashString := hex.EncodeToString(fileHash.Sum(nil))
 
 	// Register the uploaded file
 	entryReq := api.MultiPartEntriesRequest{
@@ -1879,7 +1909,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		Size:            size,
 		ClientExtension: extension,
 		LastModified:    src.ModTime(ctx).UnixMilli(),
-		FileHash:        hex.EncodeToString(fileHash.Sum(nil)),
+		FileHash:        fileHashString,
 		ParentID:        json.Number(directoryID),
 		RelativePath:    encodedLeaf,
 		WorkspaceID:     o.fs.opt.WorkspaceID,
@@ -1895,6 +1925,9 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create entry after upload: %w", err)
+	}
+	if err = o.fs.verifyIntegrity(ctx, entry.FileEntry.ID.String(), fileHashString); err != nil {
+		return err
 	}
 	return o.setMetaData(&entry.FileEntry)
 }

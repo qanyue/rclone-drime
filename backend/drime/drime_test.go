@@ -116,7 +116,7 @@ func TestListAllGetsIncompleteItemModel(t *testing.T) {
 	}
 	var got *api.Item
 	found, err := f.listAll(ctx, "1", false, true, "", func(item *api.Item) bool {
-		require.NoError(t, f.fetchMetadata(ctx, item))
+		require.NoError(t, f.verifyMetadata(ctx, item))
 		got = item
 		return true
 	})
@@ -157,6 +157,43 @@ func TestHashChunk(t *testing.T) {
 	require.Equal(t, 6, second.Len())
 	want := sha256.Sum256([]byte("firstsecond"))
 	require.Equal(t, hex.EncodeToString(want[:]), fileHasher.Sums()[hash.SHA256])
+}
+
+func TestVerifyIntegrity(t *testing.T) {
+	ctx := context.Background()
+	wantHash := strings.Repeat("a", 64)
+	for _, test := range []struct {
+		name     string
+		response string
+		wantErr  string
+	}{
+		{name: "verified", response: `{"status":"success","verified":true,"serverHash":"` + wantHash + `"}`},
+		{name: "mismatch", response: `{"status":"success","verified":false,"serverHash":"` + strings.Repeat("b", 64) + `"}`, wantErr: "integrity verification failed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				require.Equal(t, "/api/v1/file-entries/123/verify-integrity", r.URL.Path)
+				body, err := io.ReadAll(r.Body)
+				require.NoError(t, err)
+				require.JSONEq(t, `{"sha256":"`+wantHash+`"}`, string(body))
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(test.response)),
+				}, nil
+			})}
+			f := &Fs{
+				srv:   rest.NewClient(client).SetRoot(rootURL),
+				pacer: fs.NewPacer(ctx, pacer.NewDefault()),
+			}
+			err := f.verifyIntegrity(ctx, "123", wantHash)
+			if test.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, test.wantErr)
+			}
+		})
+	}
 }
 
 // TestIntegration runs integration tests against the remote
