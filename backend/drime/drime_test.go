@@ -6,6 +6,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
+	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,11 +18,19 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fstest/fstests"
+	"github.com/rclone/rclone/lib/pacer"
+	"github.com/rclone/rclone/lib/rest"
 	"github.com/stretchr/testify/require"
 )
 
 type objectWithoutHash struct {
 	*object.MemoryObject
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
 }
 
 func (o *objectWithoutHash) Hash(context.Context, hash.Type) (string, error) {
@@ -75,6 +86,57 @@ func TestObjectModTime(t *testing.T) {
 
 	o.setMetaDataAny(&api.Item{UpdatedAt: time.Date(2025, time.January, 2, 3, 4, 5, 0, time.UTC)})
 	require.Equal(t, time.Date(2025, time.January, 2, 3, 4, 5, 0, time.UTC), o.ModTime(context.Background()))
+}
+
+func TestListAllGetsIncompleteItemModel(t *testing.T) {
+	ctx := context.Background()
+	responses := []string{
+		`{"data":[{"id":123,"name":"file.txt","type":"text"}],"current_page":1,"last_page":1}`,
+		`{"fileEntry":{"id":123,"name":"file.txt","type":"text","file_size":6,"parent_id":1,"updated_at":"2025-01-02T03:04:05Z","client_last_modified":1577851200000,"mime":"text/plain","file_hash":null,"url":"api/v1/file-entries/123"}}`,
+	}
+	requests := 0
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if requests == 0 {
+			require.Equal(t, "Mozilla/5.0", r.UserAgent())
+		} else {
+			require.Equal(t, "/drive/api/v1/file-entries/123/model", r.URL.Path)
+		}
+		response := responses[requests]
+		requests++
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(response)),
+		}, nil
+	})}
+	f := &Fs{
+		opt:   Options{ListChunk: 1000},
+		srv:   rest.NewClient(client).SetRoot(rootURL),
+		pacer: fs.NewPacer(ctx, pacer.NewDefault()),
+	}
+	var got *api.Item
+	found, err := f.listAll(ctx, "1", false, true, "", func(item *api.Item) bool {
+		require.NoError(t, f.fetchMetadata(ctx, item))
+		got = item
+		return true
+	})
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, 2, requests)
+	require.Equal(t, int64(1577851200000), *got.ClientLastModified)
+
+	requests = 0
+	found, err = f.listAll(ctx, "1", false, true, "", func(item *api.Item) bool {
+		got = item
+		return true
+	})
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, 1, requests)
+	require.Nil(t, got.ClientLastModified)
+	ok, missing := got.HasRequiredMetadata()
+	require.False(t, ok)
+	require.Contains(t, missing, "client_last_modified")
 }
 
 func TestHashChunk(t *testing.T) {

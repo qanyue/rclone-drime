@@ -301,8 +301,10 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.It
 		return nil, err
 	}
 
+	var metadataErr error
 	found, err := f.listAll(ctx, directoryID, false, true, leaf, func(item *api.Item) bool {
 		if item.Name == leaf {
+			metadataErr = f.fetchMetadata(ctx, item)
 			info = item
 			return true
 		}
@@ -310,6 +312,9 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.It
 	})
 	if err != nil {
 		return nil, err
+	}
+	if metadataErr != nil {
+		return nil, metadataErr
 	}
 	if !found {
 		return nil, fs.ErrorObjectNotFound
@@ -319,8 +324,10 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.It
 
 // getItem reads item for ID given
 func (f *Fs) getItem(ctx context.Context, id string, dirID string, leaf string) (info *api.Item, err error) {
+	var metadataErr error
 	found, err := f.listAll(ctx, dirID, false, true, leaf, func(item *api.Item) bool {
 		if item.ID.String() == id {
+			metadataErr = f.fetchMetadata(ctx, item)
 			info = item
 			return true
 		}
@@ -329,7 +336,55 @@ func (f *Fs) getItem(ctx context.Context, id string, dirID string, leaf string) 
 	if !found {
 		return nil, fs.ErrorObjectNotFound
 	}
+	if metadataErr != nil {
+		return nil, metadataErr
+	}
 	return info, err
+}
+
+// readMetaDataForID reads the full item model for the ID given.
+func (f *Fs) readMetaDataForID(ctx context.Context, id string) (info *api.Item, err error) {
+	opts := rest.Opts{
+		Method:  "GET",
+		RootURL: baseURL + "drive/api/v1/file-entries/" + id + "/model",
+	}
+	if f.opt.WorkspaceID != "" {
+		opts.Parameters = url.Values{}
+		opts.Parameters.Set("workspaceId", f.opt.WorkspaceID)
+	}
+	var result struct {
+		FileEntry api.Item `json:"fileEntry"`
+	}
+	var resp *http.Response
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to read item model: %w", err)
+	}
+	return &result.FileEntry, nil
+}
+
+// fetchMetadata replaces an incomplete list item with its full item model.
+func (f *Fs) fetchMetadata(ctx context.Context, item *api.Item) error {
+	if ok, _ := item.HasRequiredMetadata(); ok {
+		return nil
+	}
+	if item.ID == "" {
+		return fmt.Errorf("incomplete metadata for %q: ID missing", item.Name)
+	}
+	name := item.Name
+	info, err := f.readMetaDataForID(ctx, item.ID.String())
+	if err != nil {
+		return err
+	}
+	if ok, missing := info.HasRequiredMetadata(); !ok {
+		return fmt.Errorf("incomplete metadata for item %q: missing %s", info.ID, strings.Join(missing, ", "))
+	}
+	info.Name = name
+	*item = *info
+	return nil
 }
 
 // errorHandler parses a non 2xx error response into an error
@@ -523,10 +578,12 @@ type listAllFn func(*api.Item) bool
 //
 // If the user fn ever returns true then it early exits with found = true
 func (f *Fs) listAll(ctx context.Context, dirID string, directoriesOnly bool, filesOnly bool, name string, fn listAllFn) (found bool, err error) {
+	// Drime omits some metadata fields for non-browser user agents.
 	opts := rest.Opts{
-		Method:     "GET",
-		Path:       "/drive/file-entries",
-		Parameters: url.Values{},
+		Method:       "GET",
+		Path:         "/drive/file-entries",
+		Parameters:   url.Values{},
+		ExtraHeaders: map[string]string{"User-Agent": "Mozilla/5.0"},
 	}
 	if dirID != "" {
 		opts.Parameters.Add("folderId", dirID)
@@ -609,6 +666,10 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	}
 	var iErr error
 	_, err = f.listAll(ctx, directoryID, false, false, "", func(info *api.Item) bool {
+		if err := f.fetchMetadata(ctx, info); err != nil {
+			iErr = err
+			return true
+		}
 		remote := path.Join(dir, info.Name)
 		entry, err := f.itemToDirEntry(ctx, remote, info)
 		if err != nil {
