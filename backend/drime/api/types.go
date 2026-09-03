@@ -58,7 +58,7 @@ type Item struct {
 	FileHash           any         `json:"file_hash"`
 	Public             bool        `json:"public"`
 	Thumbnail          bool        `json:"thumbnail"`
-	ThumbnailURL       any         `json:"thumbnail_url"`
+	ThumbnailURL       any        `json:"thumbnail_url"`
 	WorkspaceID        int         `json:"workspace_id"`
 	IsEncrypted        int         `json:"is_encrypted"`
 	Iv                 any         `json:"iv"`
@@ -69,6 +69,50 @@ type Item struct {
 	Users              []User      `json:"users"`
 	Tags               []any       `json:"tags"`
 	Permissions        Permissions `json:"permissions"`
+	fields             map[string]json.RawMessage
+}
+
+// UnmarshalJSON decodes an Item and records which fields were returned.
+func (i *Item) UnmarshalJSON(data []byte) error {
+	type item Item
+	*i = Item{}
+	if err := json.Unmarshal(data, (*item)(i)); err != nil {
+		return err
+	}
+	return json.Unmarshal(data, &i.fields)
+}
+
+// HasFields reports whether all the JSON fields were returned.
+func (i *Item) HasFields(fields ...string) bool {
+	for _, field := range fields {
+		if _, found := i.fields[field]; !found {
+			return false
+		}
+	}
+	return true
+}
+
+var (
+	commonMetadata       = []string{"id", "name", "type", "file_size", "parent_id", "updated_at"}
+	requiredFileMetadata = []string{"client_last_modified", "mime", "file_hash", "url"}
+)
+
+func requiredMetadataFields(itemType string) []string {
+	fields := append([]string{}, commonMetadata...)
+	if itemType != ItemTypeFolder {
+		fields = append(fields, requiredFileMetadata...)
+	}
+	return fields
+}
+
+// HasRequiredMetadata reports whether the item contains the required metadata.
+func (i *Item) HasRequiredMetadata() (ok bool, missing []string) {
+	for _, field := range requiredMetadataFields(i.Type) {
+		if !i.HasFields(field) {
+			missing = append(missing, field)
+		}
+	}
+	return len(missing) == 0, missing
 }
 
 // Listing response
