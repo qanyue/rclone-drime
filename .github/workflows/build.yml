@@ -24,7 +24,7 @@ permissions:
 
 jobs:
   build:
-    if: inputs.manual || (github.repository == 'rclone/rclone' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name))
+    if: inputs.manual || startsWith(github.ref, 'refs/tags/v') || (github.repository == 'rclone/rclone' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name))
     timeout-minutes: 60
     defaults:
       run:
@@ -253,6 +253,21 @@ jobs:
         # Deploy binaries if enabled in config && not a PR && not a fork
         if: env.RCLONE_CONFIG_PASS != '' && matrix.deploy && github.head_ref == '' && github.repository == 'rclone/rclone'
 
+      - name: Build release binaries
+        if: matrix.deploy && startsWith(github.ref, 'refs/tags/v') && github.repository != 'rclone/rclone'
+        run: |
+          if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then make release_dep_linux ; fi
+          make ci_release
+
+      - name: Upload release binaries
+        if: matrix.deploy && startsWith(github.ref, 'refs/tags/v') && github.repository != 'rclone/rclone'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.job_name }}
+          path: build/rclone-*
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Trim module cache before saving
         if: always()
         run: |
@@ -261,6 +276,32 @@ jobs:
           # is saved - this roughly halves the module cache size.
           modcache=$(go env GOMODCACHE | tr '\\' '/')
           find "$modcache/cache/download" -name '*.zip' -type f -delete 2>/dev/null || true
+
+  release:
+    name: "release"
+    if: startsWith(github.ref, 'refs/tags/v') && github.repository != 'rclone/rclone'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release binaries
+        uses: actions/download-artifact@v8
+        with:
+          path: release
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"; then
+            gh release upload "$GITHUB_REF_NAME" release/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$GITHUB_REF_NAME" release/* --verify-tag --generate-notes --title "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"
+          fi
 
   lint:
     if: inputs.manual || (github.repository == 'rclone/rclone' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name))

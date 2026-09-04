@@ -268,6 +268,9 @@ ifeq ($(or $(BRANCH_PATH),$(RELEASE_TAG)),)
 endif
 	@echo Beta release ready at $(BETA_URL)/testbuilds
 
+ci_release:
+	go run bin/cross-compile.go $(BUILD_FLAGS) $(BUILDTAGS) $(BUILD_ARGS) $(TAG)
+
 ci_beta:
 	git log $(LAST_TAG).. > /tmp/git-log.txt
 	go run bin/cross-compile.go -release beta-latest -git-log /tmp/git-log.txt $(BUILD_FLAGS) $(BUILDTAGS) $(BUILD_ARGS) $(TAG)
